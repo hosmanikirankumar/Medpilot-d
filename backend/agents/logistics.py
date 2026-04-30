@@ -19,7 +19,8 @@ Patient Context: {patient_context}
 Query: {raw_input}
 
 Your job is to autonomously call `get_multiple_hospitals` using the patient's coordinates.
-Return a brief summary of the hospitals found and their ETAs.
+CRITICAL: Ensure you pass `max_results=20` to the tool so we fetch ALL nearby hospitals from the Google Maps API for the live map, rather than just a few.
+Return a brief summary of the top hospitals found and their ETAs.
 """
 
 # ── LangGraph node ────────────────────────────────────────────────────────────
