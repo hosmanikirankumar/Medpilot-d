@@ -92,19 +92,6 @@ medpilot-os/
 
 ---
 
-## 🎬 Demo Sequence (for judges)
-
-| # | Action | What to show |
-|---|--------|-------------|
-| 1 | App loads | Boot logs scroll in terminal, 12 agents go idle/active |
-| 2 | Click **Patient** tab → **Check PM-JAY** | NHA query → "₹0 Treatment — PM-JAY Covered" badge |
-| 3 | Click **HITL Gate** tab | Confirmation gate loaded with Warfarin+Ashwagandha warning |
-| 4 | Review trace → **Confirm to DB** | Spinner → committed → card removes |
-| 5 | Wait ~90s (or trigger manually) | Emergency banner appears, map markers go red, WhatsApp log |
-| 6 | **Execute AI Reroute** | Acknowledged, banner fades, back to normal |
-
----
-
 ## 🔑 Environment Variables
 
 ```env
