@@ -1,0 +1,69 @@
+# ─── Python ───────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.pycache
+venv/
+.venv/
+env/
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# ─── Environment & Secrets (NEVER commit these) ───────────────────────────────
+backend/.env
+medpilot-frontend/.env
+medpilot-frontend/.env.local
+medpilot-frontend/.env.production
+# Keep .env.example files (they have no real secrets)
+
+# ─── Firebase / GCP Credentials (CRITICAL — contain private keys) ─────────────
+firebase-credentials.json
+backend/firebase-credentials.json
+*-credentials.json
+*.serviceaccount.json
+oauth.json
+backend/oauth.json
+
+# ─── Test & Debug Scripts (not needed in repo) ─────────────────────────────────
+backend/test_*.py
+backend/debug_*.py
+backend/diagnose*.py
+backend/verify_*.py
+backend/smoke_test.py
+backend/seed_db.py
+test_connection.py
+test_out.txt
+
+# ─── Build Artifacts ───────────────────────────────────────────────────────────
+medpilot-frontend/dist/
+medpilot-frontend/node_modules/
+medpilot-frontend/.vite/
+
+# ─── Frontend cache ────────────────────────────────────────────────────────────
+*.tsbuildinfo
+
+# ─── Firebase Emulator / CLI cache ────────────────────────────────────────────
+.firebase/
+.firebaserc.local
+
+# ─── GSD Planning (internal AI workflow — not project code) ───────────────────
+.planning/
+
+# ─── Misc / OS / Editor ────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+.idea/
+.vscode/
+*.log
+graphify-out/
+cloud-medpilot/
+
+# ─── Stack / planning docs (internal notes) ────────────────────────────────────
+stack.txt
+trd.txt
+medpilot_plan.md

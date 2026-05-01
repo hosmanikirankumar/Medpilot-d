@@ -1,0 +1,23 @@
+fastapi
+uvicorn[standard]
+httpx
+google-genai
+langgraph>=1.0.0
+python-multipart
+pydantic
+typing-extensions
+firebase-admin
+mcp[cli]
+fastmcp>=2.0.0
+
+google-cloud-storage
+vertexai
+python-dotenv
+
+# Google Workspace (Calendar, Tasks, Gmail)
+google-api-python-client
+google-auth-httplib2
+google-auth-oauthlib
+
+# HTTP / parsing utilities
+requests

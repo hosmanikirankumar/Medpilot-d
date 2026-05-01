@@ -29,16 +29,16 @@ Guidelines:
 - Keep response under 300 words, use markdown formatting
 - IMPORTANT: If the clinician mentions new patient data (such as new conditions, medications, allergies, or lab results) that should be added to the patient's database record, DO NOT suggest adding it in plain text. Instead, strictly output a JSON block wrapped in ```json ... ``` with the exact structure:
 ```json
-{
+{{
   "action": "ADD_TO_DB",
-  "extracted_data": {
-    "medications": [{"name": "drug", "dosage": "dose", "frequency": "frequency", "route": "route"}],
-    "lab_values": [{"test": "test", "value": 0, "unit": "unit", "reference_range": "range"}],
+  "extracted_data": {{
+    "medications": [{{"name": "drug", "dosage": "dose", "frequency": "frequency", "route": "route"}}],
+    "lab_values": [{{"test": "test", "value": 0, "unit": "unit", "reference_range": "range"}}],
     "conditions": ["condition1"]
-  },
+  }},
   "warnings": ["any clinical warnings"],
   "reasoning_trace": ["reasoning line 1", "reasoning line 2"]
-}
+}}
 ```
 
 Respond in clear clinical language:

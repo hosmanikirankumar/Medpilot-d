@@ -36,38 +36,17 @@ Respond ONLY with valid JSON (no markdown):
 """
 
 def get_firestore():
-    try:
-        import firebase_admin
-        from firebase_admin import credentials, firestore
-        if not firebase_admin._apps:
-            cred_json = os.getenv("FIREBASE_ADMIN_CREDENTIALS", "")
-            if not cred_json or cred_json.strip() in ("", "{}", "{}"):
-                return None
-            cred = credentials.Certificate(json.loads(cred_json))
-            firebase_admin.initialize_app(cred)
-        return firestore.client()
-    except Exception:
-        return None
+    """Lightweight shim — patient context is injected via state, not fetched per-request here."""
+    return None
 
 async def orchestrator_node(state: MedPilotState) -> MedPilotState:
     patient_id = state.get("patient_id", "PT-001")
-    ctx = {}
-
-    db = get_firestore()
-    if db:
-        try:
-            doc = db.collection("patients").document(patient_id).get()
-            if doc.exists:
-                ctx = doc.to_dict()
-            else:
-                print(f"Warning: Patient {patient_id} not found in Firestore.")
-        except Exception as e:
-            print(f"Failed to fetch patient context from Firestore: {e}")
-    else:
-        print("Warning: Firestore client not initialized, proceeding with empty context.")
+    # Patient context is pre-populated by the /api/chat endpoint before the graph runs.
+    # We do NOT fetch from Firestore here to avoid per-request blocking.
+    ctx = state.get("patient_context", {})
 
     prompt = ORCHESTRATOR_PROMPT.format(
-        patient_context=str(ctx),
+        patient_context=str(ctx) if ctx else "No patient selected",
         raw_input=state.get("raw_input", "")
     )
 

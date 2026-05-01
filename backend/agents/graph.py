@@ -110,7 +110,7 @@ def get_graph():
     return _graph
 
 
-async def run_query(raw_input: str, patient_id: str = "PT-001", language: str = "en") -> dict:
+async def run_query(raw_input: str, patient_id: str = "PT-001", language: str = "en", patient_context: dict = None) -> dict:
     """
     Entry point: run a user query through the full 12-agent graph.
     Returns: { final_response, intent, agent_logs, emergency, emergency_result, ... }
@@ -118,15 +118,16 @@ async def run_query(raw_input: str, patient_id: str = "PT-001", language: str = 
     graph = get_graph()
 
     initial_state: MedPilotState = {
-        "raw_input":      raw_input,
-        "patient_id":     patient_id,
-        "query_type":     "text",
-        "language":       language,
-        "hitl_required":  False,
-        "emergency":      False,
-        "retry_count":    0,
-        "agent_logs":     [],
-        "final_response": "",
+        "raw_input":       raw_input,
+        "patient_id":      patient_id,
+        "query_type":      "text",
+        "language":        language,
+        "hitl_required":   False,
+        "emergency":       False,
+        "retry_count":     0,
+        "agent_logs":      [],
+        "final_response":  "",
+        "patient_context": patient_context or {},
     }
 
     result = await graph.ainvoke(initial_state)

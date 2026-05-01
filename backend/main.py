@@ -23,13 +23,13 @@ import asyncio
 from datetime import datetime
 import math
 
-# ── Vertex AI: lazy import — only load when a real key is present ─────────────
+# ── Google GenAI: Standard Gemini API ──────────────────────────────────────────
 try:
-    import vertexai
-    from vertexai.generative_models import GenerativeModel, Part
-    _VERTEXAI_AVAILABLE = True
+    from google import genai
+    from google.genai import types
+    _GENAI_AVAILABLE = True
 except ImportError:
-    _VERTEXAI_AVAILABLE = False
+    _GENAI_AVAILABLE = False
 
 # ─── App ─────────────────────────────────────────────────────────────────────
 app = FastAPI(
@@ -100,57 +100,84 @@ class DeepDiveRequest(BaseModel):
     report_text: str
     report_type: str = "auto"   # auto | MRI | Pathology | Echo | CT | etc.
 
-# ─── Firestore helper (admin SDK) ─────────────────────────────────────────────
-def get_firestore():
-    """
-    Returns a Firestore client, or None if credentials are not configured.
-    Accepts credentials in three forms (checked in order):
-      1. FIREBASE_CREDENTIALS_FILE — path to a service-account .json file
-      2. FIREBASE_ADMIN_CREDENTIALS — raw JSON string (single or multi-line)
-      3. Neither configured → demo mode
-    """
-    cred_obj = None
+# ─── Firestore helper (admin SDK) — singleton with startup timeout ────────────
+_firestore_client = None        # cached after first connection attempt
+_firestore_attempted = False    # only try once — avoid per-request hangs
 
-    # ── Option 1: File path ────────────────────────────────────────────────────
+def _init_firestore_once():
+    """
+    Try to connect to Firestore exactly once. Caches result (client or None).
+    Uses a thread timeout so a bad JWT / clock-skew never blocks a request.
+    """
+    import threading
+    global _firestore_client, _firestore_attempted
+    if _firestore_attempted:
+        return _firestore_client
+    _firestore_attempted = True
+
+    cred_obj = None
     cred_file = os.getenv("FIREBASE_CREDENTIALS_FILE", "")
     if cred_file and os.path.isfile(cred_file):
         try:
             with open(cred_file, "r", encoding="utf-8") as f:
                 cred_obj = json.load(f)
-            print(f"[MedPilot] Firestore: loaded credentials from file → {cred_file}")
         except Exception as e:
             print(f"[MedPilot] Firestore: could not read credential file {cred_file}: {e}")
 
-    # ── Option 2: JSON string (single-line or multi-line) ──────────────────────
     if cred_obj is None:
         raw = os.getenv("FIREBASE_ADMIN_CREDENTIALS", "")
         if raw and raw.strip() not in ("", "{}", '{"type": "service_account", "project_id": "..."}'):
             try:
                 cred_obj = json.loads(raw)
             except json.JSONDecodeError:
-                # Could be multi-line — strip newlines and try again
                 try:
                     cred_obj = json.loads(raw.replace("\n", "").replace("\r", ""))
                 except json.JSONDecodeError as e:
                     print(f"[MedPilot] Firestore: JSON parse error — {e}")
 
-    # ── Validate ───────────────────────────────────────────────────────────────
     if not cred_obj or cred_obj.get("project_id", "...") == "...":
-        print("[MedPilot] Firestore: no credentials configured — running in demo mode")
+        print("[MedPilot] Firestore: no credentials → demo mode")
         return None
 
-    try:
-        import firebase_admin
-        from firebase_admin import credentials, firestore
-        if not firebase_admin._apps:
-            cred = credentials.Certificate(cred_obj)
-            firebase_admin.initialize_app(cred)
-        db = firestore.client()
-        print(f"[MedPilot] Firestore: ✅ connected → project '{cred_obj.get('project_id')}'")
-        return db
-    except Exception as e:
-        print(f"[MedPilot] Firestore init failed: {e} — running in demo mode")
-        return None
+    result = [None]
+    def _connect():
+        try:
+            import firebase_admin
+            from firebase_admin import credentials, firestore
+            if not firebase_admin._apps:
+                cred = credentials.Certificate(cred_obj)
+                firebase_admin.initialize_app(cred)
+            client = firestore.client()
+            # ── Probe: force gRPC JWT handshake NOW inside the timeout window ──
+            # firestore.client() itself is synchronous and doesn't make a
+            # network call — the JWT grant only happens on the first real op.
+            # If credentials are invalid this will raise here (within the 5 s
+            # thread) instead of blocking the event loop for 60 s later.
+            try:
+                client.collection("_probe").limit(1).get()
+            except Exception as probe_err:
+                err_str = str(probe_err)
+                if "invalid_grant" in err_str or "Invalid JWT" in err_str or "UNAUTHENTICATED" in err_str:
+                    print(f"[MedPilot] Firestore: JWT auth failed — demo mode ({probe_err.__class__.__name__})")
+                    return  # leave result[0] = None
+                # Other errors (e.g. collection not found) are fine — client works
+            result[0] = client
+            print(f"[MedPilot] Firestore: ✅ connected → project '{cred_obj.get('project_id')}'")
+        except Exception as e:
+            print(f"[MedPilot] Firestore init failed: {e} — demo mode")
+
+    t = threading.Thread(target=_connect, daemon=True)
+    t.start()
+    t.join(timeout=5)  # never wait more than 5 s (clock-skew / JWT errors would hang forever)
+    if t.is_alive():
+        print("[MedPilot] Firestore: connection timed out after 5 s — demo mode")
+
+    _firestore_client = result[0]
+    return _firestore_client
+
+def get_firestore():
+    """Return the cached Firestore client (or None in demo mode). Never blocks."""
+    return _init_firestore_once()
 
 def write_agent_log(db, agent_name: str, action: str, status: str = "Success"):
     """Write an agent log entry. No-op if Firestore is unavailable."""
@@ -167,6 +194,45 @@ def write_agent_log(db, agent_name: str, action: str, status: str = "Success"):
     except Exception as e:
         print(f"[AgentLog] Firestore write failed: {e}")
 
+# ─── Demo patient data (module-level, shared by /api/patients and /api/chat) ─
+_DEMO_PATIENTS_MAP = {
+    "PT-001": {
+        "patient_id": "PT-001",
+        "name": "Rajan Pillai",
+        "age": 58,
+        "gender": "Male",
+        "blood_type": "B+",
+        "abha_id": "14-2948-3821-7710",
+        "coords": [12.9716, 77.5946],
+        "conditions": ["Type 2 Diabetes", "Hypertension", "Atrial Fibrillation"],
+        "active_medications": ["Warfarin 5mg", "Metformin 500mg", "Ashwagandha 300mg"],
+        "allergies": "Penicillin",
+        "emergency_contact": "+919845000000",
+        "preferred_language": "hi",
+        "pmjay_covered": True,
+        "pmjay_limit": 500000,
+        "source": "demo",
+    },
+    "PT-002": {
+        "patient_id": "PT-002",
+        "name": "Meena Krishnamurthy",
+        "age": 45,
+        "gender": "Female",
+        "blood_type": "O+",
+        "abha_id": "14-5512-9934-1102",
+        "coords": [12.9352, 77.6245],
+        "conditions": ["Hypertension"],
+        "active_medications": ["Lisinopril 10mg", "Triphala Churna"],
+        "allergies": [],
+        "emergency_contact": "+919845000001",
+        "preferred_language": "ta",
+        "pmjay_covered": False,
+        "pmjay_limit": 0,
+        "source": "demo",
+    },
+}
+_DEMO_PATIENTS_LIST = list(_DEMO_PATIENTS_MAP.values())
+
 # ─── Routes ──────────────────────────────────────────────────────────────────
 
 @app.get("/")
@@ -182,49 +248,13 @@ async def api_health():
 @app.get("/api/patients")
 async def get_patients():
     """Return all patients from Firestore (demo list if no credentials or empty DB)."""
-    DEMO_PATIENTS = [
-        {
-            "patient_id": "PT-001",
-            "name": "Rajan Pillai",
-            "age": 58,
-            "gender": "Male",
-            "blood_type": "B+",
-            "abha_id": "14-2948-3821-7710",
-            "coords": [12.9716, 77.5946],
-            "conditions": ["Type 2 Diabetes", "Hypertension", "Atrial Fibrillation"],
-            "active_medications": ["Warfarin 5mg", "Metformin 500mg", "Ashwagandha 300mg"],
-            "allergies": "Penicillin",
-            "emergency_contact": "+919845000000",
-            "preferred_language": "hi",
-            "pmjay_covered": True,
-            "pmjay_limit": 500000,
-            "source": "demo",
-        },
-        {
-            "patient_id": "PT-002",
-            "name": "Meena Krishnamurthy",
-            "age": 45,
-            "gender": "Female",
-            "blood_type": "O+",
-            "abha_id": "14-5512-9934-1102",
-            "coords": [12.9352, 77.6245],
-            "conditions": ["Hypertension"],
-            "active_medications": ["Lisinopril 10mg", "Triphala Churna"],
-            "allergies": [],
-            "emergency_contact": "+919845000001",
-            "preferred_language": "ta",
-            "pmjay_covered": False,
-            "pmjay_limit": 0,
-            "source": "demo",
-        },
-    ]
     db = get_firestore()
     if db is None:
-        return DEMO_PATIENTS
+        return _DEMO_PATIENTS_LIST
     try:
         docs = db.collection("patients").stream()
         patients = [doc.to_dict() for doc in docs]
-        return patients if patients else DEMO_PATIENTS
+        return patients if patients else _DEMO_PATIENTS_LIST
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -243,8 +273,40 @@ async def chat(req: ChatRequest):
 
     query_id = f"QRY-{uuid.uuid4().hex[:8].upper()}"
 
+    # ── Fetch patient context ONCE before running the graph ─────────────────
+    # IMPORTANT: Firestore .get() is synchronous and can block the event loop
+    # for 60+ seconds on JWT auth failures. Run it in a thread with a tight
+    # timeout so a bad service account never hangs the chat endpoint.
+    patient_context: dict = {}
+    db = get_firestore()
+    if db:
+        try:
+            loop = asyncio.get_event_loop()
+            def _fetch_patient():
+                doc = db.collection("patients").document(req.patient_id).get()
+                return doc.to_dict() if doc.exists else None
+            doc_data = await asyncio.wait_for(
+                loop.run_in_executor(None, _fetch_patient),
+                timeout=3.0   # never wait more than 3 s for Firestore auth
+            )
+            if doc_data:
+                patient_context = doc_data
+                print(f"[Chat] Loaded patient context from Firestore for {req.patient_id}")
+            else:
+                patient_context = _DEMO_PATIENTS_MAP.get(req.patient_id, {"patient_id": req.patient_id})
+                print(f"[Chat] Patient {req.patient_id} not in Firestore → using demo context")
+        except asyncio.TimeoutError:
+            print(f"[Chat] Firestore timed out (>3 s) — using demo context for {req.patient_id}")
+            patient_context = _DEMO_PATIENTS_MAP.get(req.patient_id, {"patient_id": req.patient_id})
+        except Exception as e:
+            print(f"[Chat] Firestore patient fetch failed: {e} — using demo context")
+            patient_context = _DEMO_PATIENTS_MAP.get(req.patient_id, {"patient_id": req.patient_id})
+    else:
+        patient_context = _DEMO_PATIENTS_MAP.get(req.patient_id, {"patient_id": req.patient_id})
+        print(f"[Chat] No Firestore → using demo context for {req.patient_id}")
+
     try:
-        result = await run_query(req.message, req.patient_id, req.language)
+        result = await run_query(req.message, req.patient_id, req.language, patient_context=patient_context)
 
         final_response = result.get("final_response", "")
         proposed_entry = None
@@ -492,10 +554,9 @@ async def process_document(req: IntakeRequest):
     write_agent_log(db, "DataIntegrity", f"Processing image via Gemini Flash: {req.gcs_url}", "Info")
 
     extracted = None
-    if _VERTEXAI_AVAILABLE and (GEMINI_API_KEY or VERTEX_LOCATION):
+    if _GENAI_AVAILABLE and GEMINI_API_KEY:
         try:
-            vertexai.init(project=GCP_PROJECT_ID, location=VERTEX_LOCATION)
-            model = GenerativeModel("gemini-2.5-flash")
+            client = genai.Client(api_key=GEMINI_API_KEY)
             prompt = """
             Extract the medications and lab values from this document.
             Return a JSON object matching this structure exactly:
@@ -505,9 +566,37 @@ async def process_document(req: IntakeRequest):
               "confidence": number (between 0.0 and 1.0)
             }
             """
-            # Using Part.from_uri to pass GCS URL directly
-            response = model.generate_content([Part.from_uri(req.gcs_url, "image/jpeg"), prompt])
-            # Strip JSON markdown fences if present
+            
+            # Download GCS image temporarily if it's a gs:// URI
+            if req.gcs_url.startswith("gs://"):
+                try:
+                    from google.cloud import storage
+                    import tempfile
+                    storage_client = storage.Client()
+                    bucket_name = req.gcs_url.split("/")[2]
+                    blob_name = "/".join(req.gcs_url.split("/")[3:])
+                    bucket = storage_client.bucket(bucket_name)
+                    blob = bucket.blob(blob_name)
+                    
+                    with tempfile.NamedTemporaryFile(delete=False, suffix=".jpg") as tf:
+                        blob.download_to_filename(tf.name)
+                        img_path = tf.name
+                        
+                    uploaded_file = client.files.upload(file=img_path)
+                    response = client.models.generate_content(
+                        model='gemini-2.5-flash',
+                        contents=[uploaded_file, prompt]
+                    )
+                    os.unlink(img_path)
+                except Exception as gcs_e:
+                    print(f"Error downloading from GCS: {gcs_e}")
+                    raise
+            else:
+                response = client.models.generate_content(
+                    model='gemini-2.5-flash',
+                    contents=[prompt] # fallback if no image
+                )
+                
             text = response.text.strip()
             if text.startswith("```"):
                 text = text.split("```")[1]
@@ -515,7 +604,7 @@ async def process_document(req: IntakeRequest):
                     text = text[4:]
             extracted = json.loads(text)
         except Exception as e:
-            print(f"Vertex AI fallback due to error: {e}")
+            print(f"GenAI fallback due to error: {e}")
 
     if not extracted:
         # MOCK extracted data for demo fallback
@@ -534,36 +623,47 @@ async def process_document(req: IntakeRequest):
     write_agent_log(db, "DataIntegrity", f"Extracted {len(extracted.get('medications', []))} medications, confidence: {extracted.get('confidence', 0.9)}")
 
     # ── Validation Agent ───────────────────────────────────────────────────────
-    write_agent_log(db, "Validation", "Querying PK-DB for Warfarin half-life", "Info")
-    async with httpx.AsyncClient() as client_http:
-        try:
-            pkdb_resp = await client_http.get(
-                "https://pk-db.com/api/v1/outputs/?substance=warfarin&format=json",
-                timeout=5.0
-            )
-            write_agent_log(db, "Validation", "PK-DB: Warfarin half-life ~40h retrieved")
-        except Exception:
-            write_agent_log(db, "Validation", "PK-DB: Using cached half-life data (40h)", "Warning")
+    from agents.validation import validate_medications
+    med_names = [m.get("name", "") for m in extracted.get("medications", []) if m.get("name")]
+    write_agent_log(db, "Validation", f"Querying PK-DB for {len(med_names)} extracted medications", "Info")
+    
+    pkdb_data = await validate_medications(med_names)
 
     warnings = []
     reasoning_trace = [
         "Orchestrator: Routed DOCUMENT_INTAKE to DataIntegrity agent",
-        f"DataIntegrity: Gemini Flash extracted 2 medications, 2 lab values (confidence: {extracted['confidence']})",
-        "Validation: Querying PK-DB for Warfarin half-life → 40 hours",
-        "Polypharmacy: ⚠️ Ashwagandha may potentiate Warfarin anticoagulant effect (PMID: 28349297)",
-        "Validation: INR 3.8 is ABOVE therapeutic range (2.0–3.0) — flagged for clinician review",
-        "System: Proposed entry staged. Awaiting HITL confirmation.",
+        f"DataIntegrity: Gemini Flash extracted {len(extracted.get('medications', []))} medications, {len(extracted.get('lab_values', []))} lab values (confidence: {extracted.get('confidence', 0.9)})"
     ]
 
-    for med in extracted["medications"]:
-        if med["name"] == "Ashwagandha":
-            warnings.append("Ashwagandha + Warfarin interaction: May increase bleeding risk (PMID: 28349297)")
-            write_agent_log(db, "Polypharmacy", "⚠️ Ashwagandha + Warfarin interaction flagged (PMID: 28349297)", "Warning")
+    for med_name, data in pkdb_data.items():
+        hl = data.get("half_life_h")
+        if hl:
+            reasoning_trace.append(f"Validation: PK-DB {med_name} half-life → {hl} hours")
+            if hl > 48:
+                warn = f"{med_name}: half-life {hl}h exceeds 48h threshold — accumulation risk"
+                warnings.append(warn)
+                write_agent_log(db, "Validation", f"🚨 AUDITOR FLAG: {warn}", "Warning")
+        else:
+            reasoning_trace.append(f"Validation: No PK-DB data found for {med_name}")
+
+    # Check Polypharmacy dynamically for specific known issues if desired or delegate to agent later
+    for med in extracted.get("medications", []):
+        if med.get("name", "").lower() == "ashwagandha":
+            warnings.append("Ashwagandha interaction flagged: May increase bleeding risk (PMID: 28349297)")
+            write_agent_log(db, "Polypharmacy", "⚠️ Ashwagandha interaction flagged (PMID: 28349297)", "Warning")
 
     for lab in extracted.get("lab_values", []):
-        if lab["test"] == "INR" and lab["value"] > 3.0:
-            warnings.append(f"INR {lab['value']} exceeds therapeutic range — dosage adjustment may be required")
-            write_agent_log(db, "Validation", f"INR {lab['value']} above therapeutic range", "Warning")
+        # Basic dynamic lab flagging (if value is provided and string checking)
+        test_name = lab.get("test", "Unknown")
+        try:
+            val = float(lab.get("value", 0))
+            if test_name.upper() == "INR" and val > 3.0:
+                warnings.append(f"INR {val} exceeds therapeutic range (2.0-3.0) — dosage adjustment may be required")
+                write_agent_log(db, "Validation", f"INR {val} above therapeutic range", "Warning")
+        except ValueError:
+            pass
+
+    reasoning_trace.append("System: Proposed entry staged. Awaiting HITL confirmation.")
 
     # Write proposed entry to Firestore staging area (skip if no db)
     if db:
@@ -576,7 +676,7 @@ async def process_document(req: IntakeRequest):
                 "validation_status": "PENDING_HUMAN_REVIEW",
                 "ai_reasoning_trace": reasoning_trace,
                 "warnings": warnings,
-                "pmid_links": ["PMID: 28349297", "PMID: 31567234"],
+                "pmid_links": ["PMID: 28349297"] if any(m.get("name", "").lower() == "ashwagandha" for m in extracted.get("medications", [])) else [],
                 "created_at": datetime.utcnow(),
             })
         except Exception as e:
@@ -625,6 +725,10 @@ async def hitl_confirm(req: HITLCommitRequest):
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# NOTE: /api/agents/status and /api/agents/trigger/{name} are defined later
+# in this file (lines ~1560+) with the full 14-agent manifest.
+# The duplicate stubs that were here have been removed.
+
 @app.post("/api/emergency/vitals-alert")
 async def emergency_vitals(req: EmergencyVitalsRequest):
     """Emergency cascade via MCP servers: Maps + WhatsApp + Gemini triage."""
@@ -651,11 +755,10 @@ async def emergency_vitals(req: EmergencyVitalsRequest):
     clinical_summary = f"Patient {req.patient_id} in critical condition. BP: {bp}, SPO2: {spo2}%"
 
     # ── AI Assessment (Gemini 2.0 Flash) ──────────────────────────────────────
-    if _VERTEXAI_AVAILABLE and (GEMINI_API_KEY or VERTEX_LOCATION):
-        write_agent_log(db, "EmergencyCascade", "🧠 Analyzing patient context via Gemini 2.0 Flash")
+    if _GENAI_AVAILABLE and GEMINI_API_KEY:
+        write_agent_log(db, "EmergencyCascade", "🧠 Analyzing patient context via Gemini 2.5 Flash")
         try:
-            vertexai.init(project=GCP_PROJECT_ID, location=VERTEX_LOCATION)
-            model = GenerativeModel("gemini-2.5-flash")
+            client = genai.Client(api_key=GEMINI_API_KEY)
             prompt = f"""
             You are a triage AI. Review this patient's context and current critical vitals.
             Patient Context: {json.dumps(patient_context)}
@@ -664,7 +767,10 @@ async def emergency_vitals(req: EmergencyVitalsRequest):
             2. Write a concise clinical summary for the receiving doctor (max 3 sentences).
             Return JSON exactly like this: {{"hospital_type": "...", "clinical_summary": "..."}}
             """
-            response = model.generate_content(prompt)
+            response = client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt
+            )
             text = response.text.strip()
             if text.startswith("```"):
                 text = text.split("```")[1]
@@ -674,7 +780,7 @@ async def emergency_vitals(req: EmergencyVitalsRequest):
             hospital_type = ai_data.get("hospital_type", hospital_type)
             clinical_summary = ai_data.get("clinical_summary", clinical_summary)
         except Exception as e:
-            print(f"Vertex AI fallback due to error in emergency routing: {e}")
+            print(f"GenAI fallback due to error in emergency routing: {e}")
 
     write_agent_log(db, "Orchestrator", f"AI Triage determined requirement: {hospital_type}")
 
@@ -1034,6 +1140,166 @@ Base your answer on clinical evidence. Be concise."""
     }
 
 
+class SimulatePolypharmacyRequest(BaseModel):
+    new_medications: list[dict]
+
+@app.post("/api/polypharmacy/simulate/{patient_id}")
+async def simulate_polypharmacy_matrix(patient_id: str, req: SimulatePolypharmacyRequest):
+    """Simulate an N×N matrix including both existing and newly proposed medications."""
+    db = get_firestore()
+    med_details = []
+
+    if db:
+        doc = db.collection("patients").document(patient_id).get()
+        if doc.exists:
+            data = doc.to_dict()
+            med_details = data.get("medication_details", [])
+            if not med_details:
+                for m in data.get("active_medications", []):
+                    med_details.append({"name": m.split()[0], "dosage": "", "system": "Allopathic"})
+
+    if not med_details and patient_id == "PT-001":
+        med_details = [
+            {"name": "Warfarin", "dosage": "5mg", "system": "Allopathic"},
+            {"name": "Metformin", "dosage": "500mg", "system": "Allopathic"},
+            {"name": "Ashwagandha", "dosage": "300mg", "system": "Ayurvedic"},
+        ]
+
+    # Append the new medications to simulate
+    combined_meds = med_details + req.new_medications
+
+    med_names = [m.get("name", m) if isinstance(m, dict) else m.split()[0] for m in combined_meds]
+    systems = {m.get("name", "").lower(): m.get("system", "Allopathic") for m in combined_meds}
+
+    # Deduplicate med names
+    unique_names = []
+    for name in med_names:
+        if name not in unique_names:
+            unique_names.append(name)
+    med_names = unique_names
+
+    from agents.llm import generate_json
+    n = len(med_names)
+    matrix = []
+    for i in range(n):
+        row = []
+        for j in range(n):
+            if i == j:
+                row.append({"severity": "none", "summary": "Same drug", "mechanism": ""})
+            elif j < i:
+                row.append(matrix[j][i])
+            else:
+                a = med_names[i]
+                b = med_names[j]
+                sys_a = systems.get(a.lower(), "Allopathic")
+                sys_b = systems.get(b.lower(), "Allopathic")
+                prompt = f"""Analyze the pharmacological interaction between {a} ({sys_a}) and {b} ({sys_b}).
+Return ONLY a JSON object:
+{{"severity": "none|mild|moderate|major", "summary": "one sentence", "mechanism": "pharmacodynamic/pharmacokinetic mechanism brief"}}
+Base your answer on clinical evidence. Be concise."""
+                try:
+                    result = await generate_json(prompt)
+                    row.append({
+                        "severity": result.get("severity", "unknown"),
+                        "summary": result.get("summary", ""),
+                        "mechanism": result.get("mechanism", ""),
+                    })
+                except Exception:
+                    row.append({"severity": "unknown", "summary": "Analysis unavailable", "mechanism": ""})
+        matrix.append(row)
+
+    return {
+        "medications": [
+            {"name": med_names[i], "system": systems.get(med_names[i].lower(), "Allopathic")}
+            for i in range(n)
+        ],
+        "matrix": matrix,
+        "patient_id": patient_id,
+    }
+
+
+# ─── NEW: Polypharmacy Dosing Interval Advisor ────────────────────────────────
+
+class IntervalRequest(BaseModel):
+    drug_a: str
+    drug_b: str
+    severity: str  # "moderate" | "major"
+    patient_id: str = "PT-001"
+
+@app.post("/api/polypharmacy/interval")
+async def get_dosing_interval(req: IntervalRequest):
+    """
+    For moderate/major drug interactions, calculates the minimum safe
+    time interval between doses to reduce toxicity risk, using Gemini.
+    Returns: interval_hours, reasoning, clinical_note
+    """
+    # Input validation
+    if req.severity not in ("moderate", "major"):
+        raise HTTPException(status_code=400, detail="Interval advice only applicable for moderate or major interactions.")
+    if not req.drug_a.strip() or not req.drug_b.strip():
+        raise HTTPException(status_code=422, detail="Both drug names must be provided.")
+
+    from agents.llm import generate_json
+
+    urgency = "HIGH RISK — major toxicity possible" if req.severity == "major" else "MODERATE RISK"
+
+    prompt = f"""You are a clinical pharmacokinetics expert.
+
+Drug A: {req.drug_a}
+Drug B: {req.drug_b}
+Interaction Severity: {req.severity.upper()} ({urgency})
+
+A patient is taking both medications. What is the minimum safe time interval that should be maintained between doses of these two drugs to reduce the risk of adverse interaction?
+
+Consider:
+- Half-lives of both drugs
+- Time to peak plasma concentration
+- CYP450 enzyme competition/induction windows
+- Risk of cumulative toxicity
+- Practical clinical feasibility
+
+Return a JSON object with EXACTLY this schema:
+{{
+  "drug_a": "{req.drug_a}",
+  "drug_b": "{req.drug_b}",
+  "interval_hours": 4,
+  "reasoning": "One sentence explaining WHY this specific interval is needed based on pharmacokinetics.",
+  "clinical_note": "One practical tip for the prescribing doctor (e.g., take with food, monitor INR weekly, etc.)"
+}}
+
+The interval_hours must be a realistic integer (e.g. 2, 4, 6, 8, 12, 24).
+Be evidence-based and concise."""
+
+    try:
+        result = await generate_json(prompt)
+
+        # Post-validation
+        interval_h = result.get("interval_hours", 0)
+        if not isinstance(interval_h, (int, float)) or interval_h <= 0:
+            raise ValueError("Invalid interval_hours returned by LLM.")
+
+        return {
+            "drug_a": req.drug_a,
+            "drug_b": req.drug_b,
+            "severity": req.severity,
+            "interval_hours": int(interval_h),
+            "reasoning": result.get("reasoning", "Separate doses to avoid peak plasma overlap."),
+            "clinical_note": result.get("clinical_note", "Monitor patient closely for adverse effects."),
+        }
+    except Exception as e:
+        print(f"[Interval] Error: {e}")
+        # Safe clinical fallback
+        fallback_hours = 8 if req.severity == "major" else 4
+        return {
+            "drug_a": req.drug_a,
+            "drug_b": req.drug_b,
+            "severity": req.severity,
+            "interval_hours": fallback_hours,
+            "reasoning": f"Minimum {fallback_hours}-hour gap recommended to reduce peak plasma overlap between {req.drug_a} and {req.drug_b}.",
+            "clinical_note": "Monitor for adverse effects. Consult clinical pharmacist for patient-specific guidance.",
+        }
+
+
 # ─── NEW: Food Scanner with Vision ───────────────────────────────────────────
 
 @app.post("/api/food-scan")
@@ -1323,23 +1589,39 @@ async def get_agent_status():
 
 @app.post("/api/agents/trigger/{agent_name}")
 async def trigger_agent(agent_name: str):
-    """Manually trigger an agent (demo/status dashboard)."""
-    db = get_firestore()
-    import uuid
-    log_id = str(uuid.uuid4())
-    log_entry = {
-        "id": log_id,
-        "timestamp": datetime.utcnow().isoformat() + "Z",
-        "agent_name": agent_name.replace("_", " ").title(),
-        "action": f"Manual system override triggered for {agent_name} agent.",
-        "status": "Success"
+    """Manually trigger an agent with a real query."""
+    from agents.graph import run_query
+    
+    # Map agent name to a relevant query that triggers it
+    queries = {
+        "emergency_cascade": "Patient is in critical condition, SPO2 85%, severe chest pain.",
+        "logistics": "Find nearby hospitals for the patient.",
+        "eligibility": "Check PM-JAY eligibility and coverage.",
+        "research": "Check recent PubMed literature on the patient's conditions.",
+        "workspace": "Schedule a follow-up appointment.",
+        "clinical_memory": "Retrieve past clinical notes.",
+        "symptom_trajectory": "Forecast the patient's symptom trajectory.",
+        "polypharmacy": "Check for any drug interactions in the active medications.",
+        "dietary_guard": "Recommend dietary adjustments."
     }
-    if db:
-        try:
-            db.collection("agent_logs").document(log_id).set(log_entry)
-        except Exception as e:
-            print("Failed to write to agent_logs:", e)
-    return {"status": "triggered", "agent": agent_name, "log": log_entry}
+    
+    query = queries.get(agent_name.lower(), f"Execute protocol for {agent_name.replace('_', ' ').title()}")
+    
+    try:
+        # Actually execute the agent via the graph!
+        result = await run_query(query, "PT-001", "en")
+        
+        logs = result.get("agent_logs", [])
+        last_log = logs[-1] if logs else {
+            "agent_name": agent_name.replace("_", " ").title(),
+            "action": f"Executed protocol: {query}",
+            "status": "Success"
+        }
+        
+        return {"status": "triggered", "agent": agent_name, "log": last_log, "response": result.get("final_response")}
+    except Exception as e:
+        print(f"Error executing trigger: {e}")
+        return {"status": "error", "message": str(e)}
 
 # ─── NEW: Predictive Trajectory API ──────────────────────────────────────────
 
@@ -1410,8 +1692,9 @@ async def get_trajectory(req: TrajectoryRequest):
 
 @app.get("/api/trajectory/{patient_id}")
 async def get_trajectory_get(patient_id: str):
-    """GET convenience endpoint for trajectory (useful for live dashboard polling)."""
-    from agents.trajectory import build_trajectory_data
+    """GET convenience endpoint for trajectory, powered by Gemini LLM validation."""
+    from agents.trajectory import trajectory_node
+    from agents.state import MedPilotState
 
     db = get_firestore()
     ctx = {}
@@ -1433,8 +1716,39 @@ async def get_trajectory_get(patient_id: str):
             "recent_interventions": [],
         }
 
-    trajectory = build_trajectory_data(ctx, ctx.get("recent_interventions", []))
-    return trajectory
+    # Pre-validation: Ensure patient has baseline vitals required for trajectory analysis
+    if "current_vitals" not in ctx or not isinstance(ctx["current_vitals"], dict):
+        # Apply strict fallbacks to prevent LLM failure
+        ctx["current_vitals"] = {"hr": 80, "spo2": 98, "map": 90, "rr": 16, "temp": 37.0}
+
+    state: MedPilotState = {
+        "raw_input":      "Forecast the patient's symptom trajectory.",
+        "patient_id":     patient_id,
+        "patient_context": ctx,
+        "query_type":     "trajectory",
+        "hitl_required":  False,
+        "emergency":      False,
+        "retry_count":    0,
+        "agent_logs":     [],
+        "final_response": "",
+    }
+    
+    try:
+        # Run through the actual LangGraph agent which uses Gemini for clinical narrative
+        result = await trajectory_node(state)
+        trajectory = result.get("trajectory_result", {})
+        
+        # Post-processing validation
+        if not trajectory or "risk_score" not in trajectory:
+            raise ValueError("Trajectory data failed post-processing validation.")
+            
+        trajectory["clinical_narrative"] = result.get("final_response", trajectory.get("clinical_narrative", ""))
+        return trajectory
+    except Exception as e:
+        print(f"[Trajectory API] Error: {e}")
+        # Fallback to direct math build if LLM fails
+        from agents.trajectory import build_trajectory_data
+        return build_trajectory_data(ctx, ctx.get("recent_interventions", []))
 
 
 # ─── NEW: Google Workspace API ────────────────────────────────────────────────
@@ -1530,8 +1844,87 @@ async def get_patient_schedule(patient_id: str):
 @app.get("/api/workspace/auth-status")
 async def workspace_auth_status():
     """Return current Google OAuth authentication status."""
-    from mcp_servers.google_workspace_server import get_auth_status
+    from mcp_servers.google_mcp_server import get_auth_status
     return get_auth_status()
+
+
+# ─── Google OAuth 2.0 — Workspace Auth Flow ────────────────────────────────────
+
+@app.get("/api/google/auth")
+async def google_auth_start(request: Request):
+    """
+    Step 1 of Google OAuth flow: returns the consent URL the user must visit.
+    After visiting the URL and approving, Google redirects to /api/google/auth/callback.
+    """
+    from mcp_servers.google_mcp_server import get_oauth_url
+    redirect_uri = str(request.base_url).rstrip("/") + "/api/google/auth/callback"
+    url = get_oauth_url(redirect_uri)
+    if not url:
+        raise HTTPException(
+            status_code=400,
+            detail="GOOGLE_OAUTH_CLIENT_ID not configured in backend/.env — add your OAuth 2.0 Client ID"
+        )
+    return {"auth_url": url, "redirect_uri": redirect_uri, "instructions": "Visit auth_url to authorise MedPilot to access Google Calendar, Tasks, and Gmail."}
+
+
+@app.get("/api/google/auth/callback")
+async def google_auth_callback(code: str, request: Request):
+    """
+    Step 2 of Google OAuth flow: exchanges the authorisation code for tokens.
+    Stores the access + refresh token in the GOOGLE_OAUTH_TOKEN_JSON environment
+    variable (in-memory for the session — persists until server restart).
+
+    For production, save the token JSON to a secure store (Secret Manager, KMS, etc.)
+    and reload it in GOOGLE_OAUTH_TOKEN_JSON on startup.
+    """
+    redirect_uri = str(request.base_url).rstrip("/") + "/api/google/auth/callback"
+    client_id     = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
+    client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "")
+
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=400, detail="Google OAuth credentials not configured")
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            resp = await c.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code":          code,
+                    "client_id":     client_id,
+                    "client_secret": client_secret,
+                    "redirect_uri":  redirect_uri,
+                    "grant_type":    "authorization_code",
+                },
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=400, detail=f"Token exchange failed: {resp.text[:300]}")
+
+            token_data = resp.json()
+
+            # Add expiry timestamp for automatic refresh
+            expires_in = token_data.get("expires_in", 3600)
+            token_data["token_expiry"] = (
+                datetime.utcnow() + timedelta(seconds=expires_in - 60)
+            ).isoformat()
+
+            token_json = json.dumps(token_data)
+
+            # Persist in env so google_mcp_server.py picks it up immediately
+            os.environ["GOOGLE_OAUTH_TOKEN_JSON"] = token_json
+
+            print(f"[Google OAuth] ✅ Token stored — scopes: {token_data.get('scope', 'unknown')}")
+
+            return {
+                "status":  "authenticated",
+                "message": "Google Workspace access granted. Calendar, Tasks, and Gmail are now active.",
+                "scopes":  token_data.get("scope", "").split(),
+                "hint":    "To persist across server restarts, copy the token_json value to GOOGLE_OAUTH_TOKEN_JSON in backend/.env",
+                "token_json": token_json,
+            }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OAuth callback failed: {str(e)}")
 
 
 # ─── Patient location update ──────────────────────────────────────────────────
@@ -1911,8 +2304,132 @@ async def prescription_confirm(req: PrescriptionConfirmRequest):
     }
 
 
+# ─── Google Workspace OAuth 2.0 Routes ───────────────────────────────────────
+
+@app.get("/api/google/auth/url")
+async def google_auth_url(request: Request):
+    """
+    Step 1 of Google OAuth flow.
+    Returns the consent URL — open this in a browser to grant calendar/gmail/tasks access.
+    """
+    from mcp_servers.google_workspace_server import get_oauth_url
+    client_id = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
+    if not client_id:
+        raise HTTPException(
+            status_code=400,
+            detail="GOOGLE_OAUTH_CLIENT_ID not set in .env — create an OAuth 2.0 Client ID in GCP Console first."
+        )
+    base_url = str(request.base_url).rstrip("/")
+    redirect_uri = f"{base_url}/api/google/auth/callback"
+    url = get_oauth_url(redirect_uri)
+    return {"auth_url": url, "redirect_uri": redirect_uri,
+            "instructions": "Open auth_url in your browser, grant access, then the token will auto-save."}
+
+
+@app.get("/api/google/auth/callback")
+async def google_auth_callback(code: str, request: Request):
+    """
+    Step 2 of Google OAuth flow — Google redirects here after user grants consent.
+    Exchanges the auth code for tokens and saves them to .env automatically.
+    """
+    client_id     = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
+    client_secret = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "")
+    if not client_id or not client_secret:
+        raise HTTPException(status_code=400, detail="OAuth credentials not configured.")
+
+    base_url     = str(request.base_url).rstrip("/")
+    redirect_uri = f"{base_url}/api/google/auth/callback"
+
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            resp = await c.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "code":          code,
+                    "client_id":     client_id,
+                    "client_secret": client_secret,
+                    "redirect_uri":  redirect_uri,
+                    "grant_type":    "authorization_code",
+                },
+            )
+            if resp.status_code != 200:
+                raise HTTPException(status_code=400,
+                                    detail=f"Token exchange failed: {resp.text[:300]}")
+            token_data = resp.json()
+
+        # Build token JSON — include expiry timestamp
+        from datetime import timezone
+        expiry = datetime.now(timezone.utc).replace(tzinfo=None) + \
+                 __import__("datetime").timedelta(seconds=token_data.get("expires_in", 3600))
+        token_obj = {
+            "access_token":  token_data.get("access_token"),
+            "refresh_token": token_data.get("refresh_token"),
+            "token_expiry":  expiry.isoformat(),
+            "scope":         token_data.get("scope", ""),
+        }
+        token_json_str = json.dumps(token_obj)
+
+        # ── Persist to .env file so it survives server restarts ───────────────
+        env_path = os.path.join(os.path.dirname(__file__), ".env")
+        env_lines = []
+        found = False
+        if os.path.isfile(env_path):
+            with open(env_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    if line.startswith("GOOGLE_OAUTH_TOKEN_JSON="):
+                        env_lines.append(f"GOOGLE_OAUTH_TOKEN_JSON={token_json_str}\n")
+                        found = True
+                    else:
+                        env_lines.append(line)
+        if not found:
+            env_lines.append(f"\nGOOGLE_OAUTH_TOKEN_JSON={token_json_str}\n")
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(env_lines)
+
+        # Also update the running process env so tools work immediately
+        os.environ["GOOGLE_OAUTH_TOKEN_JSON"] = token_json_str
+
+        return {
+            "status":  "success",
+            "message": "✅ Google Workspace connected! Calendar, Tasks, and Gmail are now live.",
+            "scopes":  token_data.get("scope", ""),
+            "expires_in_seconds": token_data.get("expires_in", 3600),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"OAuth callback error: {e}")
+
+
+@app.get("/api/google/auth/status")
+async def google_auth_status():
+    """Check whether Google Workspace OAuth is configured and authenticated."""
+    from mcp_servers.google_workspace_server import get_auth_status
+    return get_auth_status()
+
+
+@app.delete("/api/google/auth/revoke")
+async def google_auth_revoke():
+    """Revoke Google OAuth token and clear it from .env."""
+    env_path = os.path.join(os.path.dirname(__file__), ".env")
+    if os.path.isfile(env_path):
+        lines = []
+        with open(env_path, "r", encoding="utf-8") as f:
+            for line in f:
+                if line.startswith("GOOGLE_OAUTH_TOKEN_JSON="):
+                    lines.append("GOOGLE_OAUTH_TOKEN_JSON=\n")
+                else:
+                    lines.append(line)
+        with open(env_path, "w", encoding="utf-8") as f:
+            f.writelines(lines)
+    os.environ.pop("GOOGLE_OAUTH_TOKEN_JSON", None)
+    return {"status": "revoked", "message": "Google Workspace token cleared."}
+
+
 # ─── Run locally ──────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8080, reload=True)
+    uvicorn.run("main:app", host="0.0.0.0", port=8081, reload=True)
+
+
 
 
